@@ -1,0 +1,81 @@
+name: 自动定时同步 Full-Chain-Sentinel-System
+
+on:
+  workflow_dispatch: # 允许手动触发
+  schedule: 
+    - cron: '0 */12 * * *' # 每 12 小时自动运行一次
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_GIT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Hard Sync Code and Tags
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 备份我们自己的同步脚本，防止被覆盖删除
+          cp .github/workflows/auto-sync.yml /tmp/auto-sync.yml
+          
+          # 设置上游仓库地址 (已替换为本项目)
+          git remote add upstream https://github.com/zgsfsec/Full-Chain-Sentinel-System.git
+          git fetch upstream --tags --force
+          
+          # 强制覆盖本地代码为上游 main 分支
+          git reset --hard upstream/main
+          
+          # 恢复我们自己的同步脚本并提交
+          mkdir -p .github/workflows
+          cp /tmp/auto-sync.yml .github/workflows/auto-sync.yml
+          git add .github/workflows/auto-sync.yml
+          git commit -m "chore: keep auto-sync workflow" || true
+          
+          # 强制推送代码和 Tags
+          git push origin main --force
+          git push origin --tags --force
+
+      - name: Sync All Releases
+        env:
+          GH_TOKEN: ${{ secrets.MY_GIT_TOKEN }}
+          UPSTREAM_REPO: zgsfsec/Full-Chain-Sentinel-System
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          echo "开始拉取上游所有 Release 列表..."
+          # 获取所有 Tag 并反转顺序（从旧到新创建，确保最新版最后创建）
+          TAGS=$(gh api repos/$UPSTREAM_REPO/releases --paginate | jq -r '.[].tag_name' | tac)
+          
+          for TAG in $TAGS; do
+            if gh release view "$TAG" --repo $TARGET_REPO >/dev/null 2>&1; then
+              echo "✅ 本地已存在 $TAG，跳过。"
+              continue
+            fi
+            
+            echo "⏳ 正在同步 $TAG ..."
+            TITLE=$(gh api repos/$UPSTREAM_REPO/releases/tags/$TAG --jq '.name' || echo "$TAG")
+            BODY=$(gh api repos/$UPSTREAM_REPO/releases/tags/$TAG --jq '.body' || echo "同步自上游")
+            
+            mkdir -p "./assets/$TAG"
+            gh release download "$TAG" --repo $UPSTREAM_REPO --dir "./assets/$TAG" 2>/dev/null || true
+            
+            if [ -z "$(ls -A ./assets/$TAG 2>/dev/null)" ]; then
+              gh release create "$TAG" --repo $TARGET_REPO --title "$TITLE" --notes "$BODY" --verify-tag
+            else
+              gh release create "$TAG" --repo $TARGET_REPO --title "$TITLE" --notes "$BODY" ./assets/$TAG/* --verify-tag
+            fi
+          done
+
+          # 强制校准 Latest 标签，确保与原仓库一致
+          UPSTREAM_LATEST=$(gh api repos/$UPSTREAM_REPO/releases/latest --jq '.tag_name')
+          gh release edit "$UPSTREAM_LATEST" --repo $TARGET_REPO --latest
+          echo "🎉 所有代码、Tags 和 Releases 同步完毕！"
